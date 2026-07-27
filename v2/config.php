@@ -15,19 +15,19 @@ declare(strict_types=1);
 
 return [
     // --- Microservice identity (mirror of v1 config.php) ---
-    'ms_name' => 'weather',
+    'ms_name' => 'Nizuadmin Whatsapp Gateway',
     'ms_version' => '2.0.0',
-    'ms_description' => 'Weather API',
-    'ms_author' => 'John Doe',
-    'ms_author_email' => 'joe@example.com',
+    'ms_description' => 'Nizuadmin Whatsapp Gateway API',
+    'ms_author' => 'Aleksander Zak & Ciuban Eduard',
+    'ms_author_email' => 'aleksander@orderlemon.com, eduard@orderlemon.com',
     'ms_license' => 'MIT',
     'ms_documentation' => 'https://github.com/ruvenss/pmsrapi/wiki',
-    'ms_github_repo' => 'https://github.com/ruvenss/pmsrapi/',
+    'ms_github_repo' => 'https://github.com/OrderLemon/nizuadmin_whatsapp_gateway',
 
     // --- Where the secret config JSON lives (shared with v1) ---
     // Default: parent directory of the project root, named after the service.
     // Absolute paths are recommended in production.
-    'secrets_path' => dirname(__DIR__, 2) . '/weather.json',
+    'secrets_path' => dirname(__DIR__, 2) . '/nizu.gateway.json',
 
     // --- Runtime-managed webhook registry (built/rebuilt via REST) ---
     // A SEPARATE file from the secret config: it is writable at runtime, so it
