@@ -7,6 +7,7 @@ namespace Plugins\Messages_stats;
 use Plugins\Messages_stats\Controllers\StatsController;
 use Pmsrapi\V2\Core\Container;
 use Pmsrapi\V2\Database\Connection;
+use Pmsrapi\V2\Database\Schema;
 use Pmsrapi\V2\Http\Request;
 use Pmsrapi\V2\Http\Response;
 use Pmsrapi\V2\Plugin\AbstractPlugin;
@@ -21,6 +22,7 @@ final class Messages_statsPlugin extends AbstractPlugin
             StatsController::class,
             static fn(Container $c): StatsController => new StatsController(
                 $c->get(Connection::class),
+                $c->get(Schema::class),
             ),
         );
     }

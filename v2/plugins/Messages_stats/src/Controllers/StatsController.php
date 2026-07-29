@@ -8,8 +8,8 @@ use DateInterval;
 use DatePeriod;
 use DateTimeImmutable;
 use Pmsrapi\V2\Database\Connection;
+use Pmsrapi\V2\Database\Schema;
 use Pmsrapi\V2\Exception\ApiException;
-use Pmsrapi\V2\Exception\DatabaseException;
 use Pmsrapi\V2\Http\Request;
 use Pmsrapi\V2\Http\Response;
 
@@ -21,6 +21,7 @@ final class StatsController
 
     public function __construct(
         private readonly Connection $db,
+        private readonly Schema $schema,
     ) {}
 
     /**
@@ -84,35 +85,24 @@ final class StatsController
 
         $dateFormat = $this->mysqlDateFormat($interval);
 
-        $params = [$dateFormat, $from->format('Y-m-d H:i:s'), $untilExclusive->format('Y-m-d H:i:s')];
+        $start = $from->format('Y-m-d H:i:s');
+        $end = $untilExclusive->format('Y-m-d H:i:s');
 
         $account = trim((string) $account);
-        
-        $rows = [];
 
-        if($account !== ""){
-            $rows = $this->getMessagesPerAccount($account, $direction, $params);
-
-            if($rows === false ){
-                return Response::error(500, ["database" => "Account not found!"]);
-            }
-        }else{
-            $rows = $this->getMessagesForAllAccounts(
-                $direction,
-                $dateFormat,
-                $from->format('Y-m-d H:i:s'),
-                $untilExclusive->format('Y-m-d H:i:s'));
-
-            if($rows === false ){
-                return Response::error(500,["database" => "database error!"]);
-            }
-        }
+        $tables = $account === ''
+            ? $this->accountTables($direction)
+            : [$this->accountTable($direction, $account)];
 
         $countsByPeriod = [];
         $totalMessages = 0;
-        foreach ($rows as $row) {
-            $countsByPeriod[(string) $row['period']] = (int) $row['count'];
-            $totalMessages += (int) $row['count'];
+        foreach ($tables as $table) {
+            foreach ($this->countPerPeriod($table, $dateFormat, $start, $end) as $row) {
+                $period = (string) $row['period'];
+                $count = (int) $row['count'];
+                $countsByPeriod[$period] = ($countsByPeriod[$period] ?? 0) + $count;
+                $totalMessages += $count;
+            }
         }
 
         $allPeriods = $this->generatePeriods($from, $untilExclusive, $interval);
@@ -138,85 +128,64 @@ final class StatsController
         ]);
     }
 
-    private function getMessagesPerAccount(string $account, string $direction, array $params) : array|bool
+    /**
+     * Resolves the per-account table name, whitelisting it against the live schema.
+     * Account ids are WhatsApp phone numbers, so anything non-numeric is rejected
+     * before it can reach an identifier position (identifiers cannot be bound).
+     */
+    private function accountTable(string $direction, string $account): string
     {
-        $tableName = $direction . "_" . $account;
-
-        $sql = "SELECT DATE_FORMAT(`delivered_date`, ?) AS `period`, COUNT(*) AS `count`
-            FROM `$tableName`
-            WHERE `delivered_date` >= ? AND `delivered_date` < ?";
-
-        $sql .= " GROUP BY `period` ORDER BY `period` ASC";
-
-        try{
-            $rows = $this->db->select($sql, $params);
-            return $rows;
+        if (preg_match('/^[0-9]{1,32}$/', $account) !== 1) {
+            throw new ApiException(
+                'Invalid account. Expected a numeric account id.',
+                400,
+                'validation_error',
+            );
         }
-        catch(DatabaseException $ex){
-            error_log($ex->getMessage());
-            return false;
-        }
-    } 
 
-    private function getMessagesForAllAccounts(
-            string $direction,
-            string $dateFormat,
-            string $startDate,
-            string $endDate) : array|bool
+        $table = $direction . '_' . $account;
+
+        if ($this->schema->columns($table) === []) {
+            throw new ApiException(
+                "Unknown account: {$account}",
+                404,
+                'not_found',
+            );
+        }
+
+        return $table;
+    }
+
+    /**
+     * @return list<string> every per-account message table for this direction
+     */
+    private function accountTables(string $direction): array
     {
-        $tablesSql = "
-            SELECT table_name
-            FROM information_schema.tables
-            WHERE table_schema = DATABASE()
-            AND table_name LIKE CONCAT(?, '\\_%')
-            AND table_name NOT LIKE CONCAT(?, '\\_stats\\_%')";
+        $rows = $this->db->select(
+            "SELECT TABLE_NAME FROM information_schema.TABLES
+             WHERE TABLE_SCHEMA = ? AND TABLE_NAME REGEXP ?
+             ORDER BY TABLE_NAME ASC",
+            [$this->db->databaseName(), '^' . $direction . '_[0-9]+$'],
+        );
 
-        $tables = [];
+        return array_map(static fn(array $row): string => (string) $row['TABLE_NAME'], $rows);
+    }
 
-        try{
-            $tables = $this->db->select($tablesSql,[$direction, $direction]);
-        }
-        catch(DatabaseException $ex){
-            error_log($ex->getMessage());
-            return false;
-        }
+    /**
+     * @return list<array{period: string, count: int|string}>
+     */
+    private function countPerPeriod(string $table, string $dateFormat, string $start, string $end): array
+    {
+        $sql = sprintf(
+            'SELECT DATE_FORMAT(`delivered_date`, ?) AS `period`, COUNT(*) AS `count`
+             FROM %s
+             WHERE `delivered_date` >= ? AND `delivered_date` < ?
+             GROUP BY `period`',
+            $this->schema->quote($table),
+        );
 
-        if(empty($tables)){
-            return [];
-        }
-
-        $selects = [];
-        $params = [];
-
-        foreach (array_values($tables) as $key => $table) {
-            $tableName = $table["table_name"];
-
-            $selects[] = "SELECT DATE_FORMAT(`delivered_date`, ?) AS `period`, COUNT(*) AS `count`
-                        FROM `{$tableName}`
-                        WHERE `delivered_date` >= ? AND `delivered_date` < ?
-                        GROUP BY `period`";
-
-            $params[] = $dateFormat; // e.g. '%Y-%m'
-            $params[] = $startDate;
-            $params[] = $endDate;
-        }
-
-        $unionSql = implode(' UNION ALL ', $selects);
-
-        $finalSql = "SELECT `period`, SUM(`count`) AS `count`
-             FROM ({$unionSql}) AS combined
-             GROUP BY `period`
-             ORDER BY `period` ASC";
-
-        try{
-            $rows = $this->db->select($finalSql, $params);
-            return $rows;
-        }
-        catch(DatabaseException $ex){
-            error_log($ex->getMessage());
-            return false;
-        }
-    } 
+        return $this->db->select($sql, [$dateFormat, $start, $end]);
+    }
 
     private function parseDate(string $value, string $field): DateTimeImmutable
     {
