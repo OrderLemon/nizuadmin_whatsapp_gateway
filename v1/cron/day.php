@@ -26,18 +26,32 @@ if (file_exists($secrets_path)) {
 if (file_exists($v1_dir . '/vendor/autoload.php')) {
     include_once $v1_dir . '/vendor/autoload.php';
 }
-if (isset(ms_secrets['db']) && file_exists($v1_dir . '/general/db.php')) {
+if (isset(ms_secrets['db']['host']) && file_exists($v1_dir . '/general/db.php')) {
+    if (!function_exists('http_response')) {
+        // db.php calls http_response() on connection failure; that function
+        // only exists in the HTTP entry point (index.php), not in this cron
+        // context, so provide a minimal fallback to avoid a fatal error.
+        function http_response($code, $data)
+        {
+            echo json_encode($data) . "\n";
+            exit($code >= 400 ? 1 : 0);
+        }
+    }
     include_once $v1_dir . '/general/db.php';
 }
 if (file_exists($v1_dir . '/general/custom_functions.php')) {
     include_once $v1_dir . '/general/custom_functions.php';
 }
 function collect_conversations_per_day(){
-    /* 
-    Collect conversations for the day
-    insert them into the database table `daily_conversations_stats`
-    if the table does not exist, create it first
+    /*
+    Collect conversations for every day since Feb 2023, insert/update them
+    into `daily_conversations_stats` (creating it and `whatsapp_pricing_rates`
+    first if needed). Days with no messages are still upserted with 0s.
     */
-    echo "\ncollect_conversations_per_day\n";
+    if (function_exists('wa_collect_daily_conversation_stats')) {
+        wa_collect_daily_conversation_stats('2023-02-01', date('Y-m-d'));
+    } else {
+        echo "collect_conversations_per_day: database not configured, skipping\n";
+    }
 }
 collect_conversations_per_day();
