@@ -1,6 +1,6 @@
 # PHP Micro Service REST API 0.0.27
 
-Yes! Yet another REST API built in PHP.
+Yes! Yet another REST API built in PHP
 
 <img src="https://github.com/ruvenss/pmsrapi/blob/main/documentation/pmsrapi.png?raw=true" style="width: 64px">
 

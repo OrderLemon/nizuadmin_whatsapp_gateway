@@ -1,0 +1,9 @@
+{
+    "name": "Messages_stats",
+    "slug": "messages_stats",
+    "description": "Message statistics endpoint with Chart.js-ready output.",
+    "version": "1.0.0",
+    "author": "olek1305",
+    "enabled": true,
+    "dependencies": []
+}
