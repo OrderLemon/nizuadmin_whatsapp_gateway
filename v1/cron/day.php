@@ -44,12 +44,17 @@ if (file_exists($v1_dir . '/general/custom_functions.php')) {
 }
 function collect_conversations_per_day(){
     /*
-    Collect conversations for every day since Feb 2023, insert/update them
-    into `daily_conversations_stats` (creating it and `whatsapp_pricing_rates`
-    first if needed). Days with no messages are still upserted with 0s.
+    This runs daily at 1am. Only collect today's and yesterday's messages,
+    insert/update just those two days' rows in `daily_conversations_stats`
+    (creating it and `whatsapp_pricing_rates` first if needed). Every other
+    day is left untouched. For a one-off historical backfill, call
+    wa_collect_daily_conversation_stats() directly with an explicit date
+    range instead of running this function.
     */
     if (function_exists('wa_collect_daily_conversation_stats')) {
-        wa_collect_daily_conversation_stats('2023-02-01', date('Y-m-d'));
+        $yesterday = (new DateTimeImmutable('yesterday'))->format('Y-m-d');
+        $today = (new DateTimeImmutable('today'))->format('Y-m-d');
+        wa_collect_daily_conversation_stats($yesterday, $today);
     } else {
         echo "collect_conversations_per_day: database not configured, skipping\n";
     }
