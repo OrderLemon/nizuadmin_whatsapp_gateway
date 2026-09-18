@@ -475,3 +475,375 @@ function wa_collect_daily_conversation_stats(string $startDate, string $endDate)
 
     echo "wa_collect_daily_conversation_stats: processed " . count($daily) . " days, wrote $rowCount rows\n";
 }
+
+/* ---------------------------------------------------------------------
+ * Per-client (per-account) message statistics
+ * ---------------------------------------------------------------------
+ * Powers GET/get_messages_per_client.php: the exact same
+ * (day, country_code) aggregation the daily cron stores in
+ * `daily_conversations_stats`, but computed live for a caller-supplied
+ * set of account numbers and returned per client instead of stored.
+ *
+ * Every decision that produces a number - country attribution, the
+ * Marketing/Service split, which rate version applies - is delegated to
+ * the same helpers the cron calls, so the endpoint can never drift away
+ * from the daily job. Only the scope (chosen accounts), the filters and
+ * the output shape differ.
+ */
+
+/**
+ * Column name => lowercased column type for $table, cached per request.
+ * The per-account tables are created by the gateway rather than by this
+ * repo, so anything beyond the columns the cron already relies on is
+ * discovered instead of assumed.
+ *
+ * @return array<string, string>
+ */
+function wa_table_columns(string $table): array
+{
+    static $cache = [];
+
+    if (isset($cache[$table])) {
+        return $cache[$table];
+    }
+
+    $columns = [];
+    if (defined('dbconn')) {
+        try {
+            $result = dbconn->query('DESC `' . $table . '`');
+            if ($result !== false) {
+                while ($field = $result->fetch_assoc()) {
+                    $columns[(string) $field['Field']] = strtolower((string) $field['Type']);
+                }
+            }
+        } catch (mysqli_sql_exception $e) {
+            // Unreadable table - treated as "no optional columns", which
+            // makes every caller fall back to its documented default.
+            $columns = [];
+        }
+    }
+
+    $cache[$table] = $columns;
+    return $columns;
+}
+
+/**
+ * A SQL expression evaluating to 1/0 for "this send errored", plus a note
+ * of what it was derived from so the response can tell the caller which
+ * basis was actually used.
+ *
+ * A dedicated error column is preferred when the table has one; otherwise
+ * a send that never reached the recipient is treated as the error case.
+ *
+ * @return array{expression: string, basis: string}
+ */
+function wa_error_expression(string $table): array
+{
+    $columns = wa_table_columns($table);
+
+    foreach (['error', 'error_message', 'error_code', 'errors', 'failure_reason'] as $candidate) {
+        if (!isset($columns[$candidate])) {
+            continue;
+        }
+
+        $isNumeric = preg_match('/^(tinyint|smallint|mediumint|int|bigint|decimal|float|double|bit)/', $columns[$candidate]) === 1;
+
+        return [
+            'expression' => $isNumeric
+                ? "(`$candidate` IS NOT NULL AND `$candidate` <> 0)"
+                : "(`$candidate` IS NOT NULL AND TRIM(`$candidate`) <> '')",
+            'basis' => $candidate,
+        ];
+    }
+
+    if (isset($columns['delivered'])) {
+        return ['expression' => '(`delivered` = 0)', 'basis' => 'delivered = 0'];
+    }
+
+    return ['expression' => '(1 = 0)', 'basis' => 'unavailable'];
+}
+
+/**
+ * One empty (day, country_code) bucket. Mirrors the columns of
+ * `daily_conversations_stats`, plus messages_out_error which the cron has
+ * no column for but the endpoint reports.
+ */
+function wa_empty_client_stats(): array
+{
+    return [
+        'messages_in' => 0,
+        'messages_out' => 0,
+        'messages_in_success' => 0,
+        'messages_out_success' => 0,
+        'messages_out_error' => 0,
+        'total_marketing_messages' => 0,
+        'total_service_messages' => 0,
+        'cost_in' => 0.0,
+        'cost_out' => 0.0,
+    ];
+}
+
+function wa_client_bucket(array &$buckets, string $day, string $country): void
+{
+    if (!isset($buckets[$day][$country])) {
+        $buckets[$day][$country] = wa_empty_client_stats();
+    }
+}
+
+/**
+ * Costs are rendered with the same 4-decimal precision the cron stores, so
+ * an endpoint row and a `daily_conversations_stats` row are comparable
+ * value for value.
+ */
+function wa_format_client_stats(array $stats): array
+{
+    $stats['cost_in'] = number_format((float) $stats['cost_in'], 4, '.', '');
+    $stats['cost_out'] = number_format((float) $stats['cost_out'], 4, '.', '');
+
+    return $stats;
+}
+
+/**
+ * The WHERE fragment implementing the status / errors_only filters. Both
+ * directions share it - in_ and out_ tables both carry `delivered`.
+ */
+function wa_client_status_where(array $filters, string $errorExpression): string
+{
+    $clauses = [];
+
+    if ($filters['status'] === 'delivered') {
+        $clauses[] = '`delivered` = 1';
+    } elseif ($filters['status'] === 'undelivered') {
+        $clauses[] = '`delivered` = 0';
+    }
+
+    if ($filters['errors_only']) {
+        $clauses[] = $errorExpression;
+    }
+
+    return $clauses === [] ? '' : ' AND ' . implode(' AND ', $clauses);
+}
+
+/**
+ * The shared date-range WHERE fragment. $rangeStart/$rangeEndExclusive are
+ * already validated 'Y-m-d H:i:s' strings; they are escaped anyway because
+ * the v1 sql* helpers interpolate rather than bind.
+ */
+function wa_client_range_where(string $rangeStart, string $rangeEndExclusive): string
+{
+    return '`incoming_date` IS NOT NULL'
+        . " AND `incoming_date` >= '" . mysqli_real_escape_string(dbconn, $rangeStart) . "'"
+        . " AND `incoming_date` < '" . mysqli_real_escape_string(dbconn, $rangeEndExclusive) . "'";
+}
+
+/**
+ * Adds one account's incoming totals, attributing each message to a country
+ * via the sender's phone number - the same rule wa_accumulate_in_stats()
+ * uses for the daily job.
+ */
+function wa_accumulate_client_in_stats(array &$buckets, string $table, array $filters, string $rangeStart, string $rangeEndExclusive): void
+{
+    $where = wa_client_range_where($rangeStart, $rangeEndExclusive)
+        . wa_client_status_where($filters, wa_error_expression($table)['expression']);
+
+    $rows = sqlSelectRows(
+        $table,
+        'DATE(`incoming_date`) AS `day`, `sender_phone` AS `sender_phone`, `delivered` AS `delivered`, COUNT(*) AS `total`',
+        $where,
+        '',
+        '',
+        '`day`, `sender_phone`, `delivered`'
+    );
+
+    foreach ($rows as $row) {
+        $sender = (string) ($row['sender_phone'] ?? '');
+        $country = $sender === '' ? 'XX' : wa_recipient_country_code($sender);
+
+        if ($filters['countries'] !== [] && !in_array($country, $filters['countries'], true)) {
+            continue;
+        }
+
+        $day = (string) $row['day'];
+        $total = (int) $row['total'];
+        wa_client_bucket($buckets, $day, $country);
+
+        $buckets[$day][$country]['messages_in'] += $total;
+        if ((int) $row['delivered'] === 1) {
+            $buckets[$day][$country]['messages_in_success'] += $total;
+        }
+    }
+}
+
+/**
+ * Adds one account's outgoing totals, the Marketing/Service split and
+ * cost_out, attributing each message to a country and pricing market via
+ * the recipient's phone number - the same rules wa_accumulate_out_stats()
+ * uses for the daily job. Cost is charged per successfully delivered
+ * message at its category's rate as of that message's own day.
+ */
+function wa_accumulate_client_out_stats(array &$buckets, string $table, array $filters, string $rangeStart, string $rangeEndExclusive, array $rates): void
+{
+    $errorExpression = wa_error_expression($table)['expression'];
+
+    $where = wa_client_range_where($rangeStart, $rangeEndExclusive)
+        . wa_client_status_where($filters, $errorExpression);
+
+    $recipient = "COALESCE(JSON_UNQUOTE(JSON_EXTRACT(`payload`, '\$.recipient_phonenumber')), JSON_UNQUOTE(JSON_EXTRACT(`payload`, '\$.to')))";
+
+    $rows = sqlSelectRows(
+        $table,
+        'DATE(`incoming_date`) AS `day`, `message_type` AS `message_type`, `delivered` AS `delivered`, '
+            . $errorExpression . ' AS `is_error`, ' . $recipient . ' AS `recipient`, COUNT(*) AS `total`',
+        $where,
+        '',
+        '',
+        '`day`, `message_type`, `delivered`, `is_error`, `recipient`'
+    );
+
+    foreach ($rows as $row) {
+        $category = wa_out_message_category((string) ($row['message_type'] ?? ''));
+        if ($filters['message_type'] !== 'all' && $filters['message_type'] !== $category) {
+            continue;
+        }
+
+        $recipientPhone = (string) ($row['recipient'] ?? '');
+        $geo = $recipientPhone === '' ? ['country' => 'XX', 'market' => 'Other'] : wa_recipient_geo($recipientPhone);
+
+        if ($filters['countries'] !== [] && !in_array($geo['country'], $filters['countries'], true)) {
+            continue;
+        }
+
+        $day = (string) $row['day'];
+        $country = $geo['country'];
+        $total = (int) $row['total'];
+        wa_client_bucket($buckets, $day, $country);
+
+        $buckets[$day][$country]['messages_out'] += $total;
+
+        if ($category === 'marketing') {
+            $buckets[$day][$country]['total_marketing_messages'] += $total;
+        } else {
+            $buckets[$day][$country]['total_service_messages'] += $total;
+        }
+
+        if ((int) $row['is_error'] === 1) {
+            $buckets[$day][$country]['messages_out_error'] += $total;
+        }
+
+        if ((int) $row['delivered'] === 1) {
+            $buckets[$day][$country]['messages_out_success'] += $total;
+            $rate = wa_pricing_rate_for($rates, $geo['market'], $category, $day);
+            if ($rate !== null) {
+                $buckets[$day][$country]['cost_out'] += $rate * $total;
+            }
+        }
+    }
+}
+
+/**
+ * Loads the pricing rates when the table exists. A deployment where the
+ * daily cron has never run yet has no `whatsapp_pricing_rates` table; that
+ * must degrade to "costs are 0" rather than blow up a read-only endpoint,
+ * so this never creates or seeds anything.
+ */
+function wa_client_pricing_rates(string $dbName): array
+{
+    return sqlTableExist('whatsapp_pricing_rates', $dbName) ? wa_load_pricing_rates() : [];
+}
+
+/**
+ * Computes per-(day, country_code) stats for each of $numbers, restricted
+ * to that account's own in_/out_ tables.
+ *
+ * $numbers must already be validated as bare digit strings - they land in
+ * a table identifier, which cannot be escaped or bound.
+ *
+ * $filters: date_from, date_to ('Y-m-d'), direction (in|out|both), status
+ * (all|delivered|undelivered), errors_only (bool), countries (list of
+ * ISO 3166-1 alpha-2), message_type (all|marketing|service).
+ *
+ * @param list<string> $numbers
+ * @return array{clients: list<array>, totals: array, unknown_numbers: list<string>, error_basis: array<string, string>, pricing_rates_available: bool}
+ */
+function wa_collect_client_message_stats(array $numbers, array $filters): array
+{
+    $dbName = ms_secrets['db']['name'];
+    $rates = wa_client_pricing_rates($dbName);
+
+    $rangeStart = $filters['date_from'] . ' 00:00:00';
+    $rangeEndExclusive = (new DateTimeImmutable($filters['date_to']))->modify('+1 day')->format('Y-m-d') . ' 00:00:00';
+
+    // A message_type filter only means something for outgoing traffic -
+    // incoming messages are never templates - so asking for one drops the
+    // incoming side rather than silently counting it unfiltered.
+    $wantsIn = in_array($filters['direction'], ['in', 'both'], true) && $filters['message_type'] === 'all';
+    $wantsOut = in_array($filters['direction'], ['out', 'both'], true);
+
+    $clients = [];
+    $unknownNumbers = [];
+    $errorBasis = [];
+    $overall = wa_empty_client_stats();
+
+    foreach ($numbers as $number) {
+        $inTable = 'in_' . $number;
+        $outTable = 'out_' . $number;
+
+        $hasIn = $wantsIn && sqlTableExist($inTable, $dbName);
+        $hasOut = $wantsOut && sqlTableExist($outTable, $dbName);
+
+        if (!$hasIn && !$hasOut) {
+            $unknownNumbers[] = $number;
+            continue;
+        }
+
+        $buckets = [];
+
+        if ($hasIn) {
+            wa_accumulate_client_in_stats($buckets, $inTable, $filters, $rangeStart, $rangeEndExclusive);
+        }
+
+        if ($hasOut) {
+            $errorBasis[$outTable] = wa_error_expression($outTable)['basis'];
+            wa_accumulate_client_out_stats($buckets, $outTable, $filters, $rangeStart, $rangeEndExclusive, $rates);
+        }
+
+        ksort($buckets);
+
+        $days = [];
+        $clientTotals = wa_empty_client_stats();
+
+        foreach ($buckets as $day => $countries) {
+            ksort($countries);
+
+            foreach ($countries as $country => $stats) {
+                $days[] = array_merge(
+                    ['day' => (string) $day, 'country_code' => (string) $country],
+                    wa_format_client_stats($stats)
+                );
+
+                foreach ($stats as $key => $value) {
+                    $clientTotals[$key] += $value;
+                    $overall[$key] += $value;
+                }
+            }
+        }
+
+        $clients[] = [
+            'number' => $number,
+            'tables' => [
+                'in' => $hasIn ? $inTable : null,
+                'out' => $hasOut ? $outTable : null,
+            ],
+            'totals' => wa_format_client_stats($clientTotals),
+            'days' => $days,
+        ];
+    }
+
+    return [
+        'clients' => $clients,
+        'totals' => wa_format_client_stats($overall),
+        'unknown_numbers' => $unknownNumbers,
+        'error_basis' => $errorBasis,
+        'pricing_rates_available' => $rates !== [],
+    ];
+}
